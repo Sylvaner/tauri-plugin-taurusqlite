@@ -1,0 +1,14 @@
+[package]
+name = "tauri-plugin-taurusqlite"
+version = "0.1.0"
+authors = [ "Sylvain DANGIN" ]
+description = "Taurusqlite is a plugin for Tauri that provides a light integration of Rusqlite"
+edition = "2021"
+rust-version = "1.59"
+exclude = ["/examples", "/webview-dist", "/webview-src", "node_modules"]
+
+[dependencies]
+tauri = { version = "1.2.4" }
+serde = "1.0"
+thiserror = "1.0"
+rusqlite = { version = "0.29.0", features = ["bundled"] }
