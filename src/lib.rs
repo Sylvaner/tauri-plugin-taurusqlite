@@ -1,21 +1,23 @@
-//! Taurusqlite is a plugin for Tauri that provides a light integration of Rusqlite
-//!
-use std::{path::Path, collections::HashMap, sync::Mutex};
-use rusqlite::{Connection, Statement, types::{ValueRef, Value}, Row, Params};
-use serde::{ser::Serializer, Serialize};
+use std::{collections::HashMap, sync::Mutex};
+use rusqlite::Connection;
+use serde::{ser::Serializer, Serialize, Deserialize};
+use serde_json::{Value as JsonValue};
+use sqlite::{connect, execute as sqlite_execute, select as sqlite_select, batch as sqlite_batch};
 use tauri::{
-  command,
   plugin::{Builder, TauriPlugin},
   Manager, 
-  Runtime, State,
+  AppHandle, Runtime, State,
 };
+mod sqlite;
+
+const STORE_FILENAME: &str = "store.sqlite";
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error(transparent)]
     Rusqlite(rusqlite::Error),
-    #[error("Not connected")]
-    NotConnected(),
+    #[error("Not connected to {0}")]
+    NotConnected(String),
 }
 
 // Pass error through API
@@ -30,134 +32,90 @@ impl Serialize for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// Open connection on SQLite database
-/// 
-/// # Example
-/// ```
-/// let conn = get_conn("./path/to/db.sqlite");
-/// ```
-/// ## Failure
-/// Panics on error
-/// 
-fn get_conn(path_to_db: &str) -> Connection {
-    let database_path = Path::new(path_to_db);
-    match Connection::open(database_path) {
-        Ok(conn) => conn,
-        Err(error) => panic!("Unable to open {:?}: {:?}", database_path, error)
-    }
-}
-
-/// Prepare statement from SQL query
-/// 
-/// # Example
-/// ```
-/// let conn = get_conn("./path/to/db.sqlite");
-/// let mut stmt = prepare(&conn, "SELECT * FROM person");
-/// ```
-/// 
-/// ## Failure
-/// Panics on error
-/// 
-fn prepare<'a>(conn: &'a Connection, query: &str) -> Statement<'a> {
-    let stmt = match conn.prepare(query) {
-        Ok(stmt) => stmt,
-        Err(error) => panic!("Error create statement : {:?}", error)
-    };
-    stmt
-}
-
-/// Get columns name from statement
-/// 
-/// # Example
-/// ```
-/// let conn = get_conn("./path/to/db.sqlite");
-/// let mut stmt = prepare(&conn, "SELECT * FROM person");
-/// let names = get_columns_names(&stmt);
-/// ```
-/// 
-fn get_columns_names(stmt: &Statement) -> Vec<String> {
-    let mut result: Vec<String> = Vec::new();
-    for name in stmt.column_names() {
-        result.push(name.to_string());
-    }
-    result
-}
-
-/// Parse column data from result
-/// 
-fn parse_column_data(value_to_parse: ValueRef) -> Value {
-    match value_to_parse {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(i) => Value::Integer(i),
-        ValueRef::Real(f) => Value::Real(f),
-        ValueRef::Text(t) => Value::Text(std::str::from_utf8(t).unwrap().to_string()),
-        ValueRef::Blob(b) => Value::Blob(b.to_vec())
-    }
-}
-
-/// Parse row from result
-/// 
-fn parse_row(names: &[String], row: &Row) -> HashMap<String, Value> {
-    let mut parsed_row: HashMap<String, Value> = HashMap::new();
-    for name in names.iter() {
-        match row.get_ref(name.as_str()) {
-            Ok(column_ref) => parsed_row.insert(name.to_owned(), parse_column_data(column_ref)),
-            Err(e) => panic!("{:?}", e)
-        };
-    }
-    parsed_row
-}
-
-/// Query the database
-/// 
-/// # Example
-/// ```
-/// let conn = get_conn("./path/to/db.sqlite");
-/// let persons = select(&conn, "SELECT * FROM student WHERE firstname = ?1", ["Bob"]);
-/// ```
-/// 
-#[command]
-fn select<P: Params>(conn: &Connection, query: &str, params: P) -> Vec<HashMap<String, Value>> {
-    let mut result: Vec<HashMap<String, Value>> = Vec::new();
-    let mut stmt = prepare(conn, query);
-    let names = get_columns_names(&stmt);
-    let rows_result = stmt.query(params);
-    if let Ok(mut rows) = rows_result {
-        loop {
-            let row = match rows.next() {
-                Ok(row_opt) => match row_opt {
-                    Some(row) => row,
-                    None => break
-                },
-                Err(_) => break
-            };
-            result.push(parse_row(&names, row));
-        }
-    }
-    result
-}
-
 #[derive(Default)]
 struct DbInstances (
     Mutex<HashMap<String, Connection>>
 );
 
-#[command]
-fn open(state: State<'_, DbInstances>, database_path: &str) -> Result<bool> {
-    let path = Path::new(database_path);
-    match Connection::open(path) {
-        Ok(conn) => {
-            state.0.lock().unwrap().insert("conn".into(), conn);
+#[derive(Deserialize)]
+struct OpenOptions {
+    disable_foreign_keys: Option<bool>
+}
+
+fn open_db(state: State<'_, DbInstances>, db_path: String, options: OpenOptions) -> Result<bool> {
+    match connect(&db_path) {
+        Ok(mut conn) => {
+            if let Some(disable_foreign_keys) = options.disable_foreign_keys {
+                if disable_foreign_keys == true {
+                    _ = sqlite_execute(&mut conn, "PRAGMA foreign_keys = 0", vec!());
+                }
+            }
+            state.0.lock().unwrap().insert(db_path, conn);
             Ok(true)
         }    
-        Err(error) => Err(Error::Rusqlite(error))
+        Err(e) => Err(Error::Rusqlite(e))
+    }
+}
+
+#[tauri::command]
+async fn load<R: Runtime>(app: AppHandle<R>, state: State<'_, DbInstances>, options: OpenOptions) -> Result<String> {
+    let app_dir = app.path_resolver().app_data_dir().expect("Failed to resolve app_dir");
+    let db_path = app_dir.join(STORE_FILENAME).as_path().display().to_string();
+    match open_db(state, db_path.clone(), options) {
+        Ok(_) => Ok(db_path),
+        Err(e) => Err(e)
+    }
+}
+
+#[tauri::command]
+async fn open(state: State<'_, DbInstances>, db_path: String, options: OpenOptions) -> Result<bool> {
+    open_db(state, db_path, options)
+}
+
+#[tauri::command]
+async fn set_pragma(state: State<'_, DbInstances>, db_path: String, key: String, value: JsonValue) -> Result<bool> {
+    let mut mutex_map = state.0.lock().unwrap();
+    let mut conn = mutex_map.get_mut(&db_path).ok_or(Error::NotConnected(db_path))?;
+    match sqlite_execute(&mut conn, format!("PRAGMA {} = {}", key, value).as_str(), vec!()) {
+        Ok(result) => Ok(result),
+        Err(e) => Err(Error::Rusqlite(e))
+    }
+}
+
+#[tauri::command]
+async fn select(state: State<'_, DbInstances>, db_path: String, query: String, params: Vec<JsonValue>) -> Result<Vec<HashMap<String, JsonValue>>> {
+    let mut mutex_map = state.0.lock().unwrap();
+    let conn = mutex_map.get_mut(&db_path).ok_or(Error::NotConnected(db_path))?;
+    match sqlite_select(&conn, query.as_str(), params) {
+        Ok(result) => Ok(result),
+        Err(e) => Err(Error::Rusqlite(e))
+    }
+}
+
+#[tauri::command]
+async fn execute(state: State<'_, DbInstances>, db_path: String, query: String, params: Vec<JsonValue>) -> Result<bool> {
+    let mut mutex_map = state.0.lock().unwrap();
+    let mut conn = mutex_map.get_mut(&db_path).ok_or(Error::NotConnected(db_path))?;
+    match sqlite_execute(&mut conn, query.as_str(), params) {
+        Ok(result) => Ok(result),
+        Err(e) => Err(Error::Rusqlite(e))
+    }
+}
+
+#[tauri::command]
+async fn batch(state: State<'_, DbInstances>, db_path: String, queries: Vec<(&str, Vec<JsonValue>)>) -> Result<bool> {
+    let mut mutex_map = state.0.lock().unwrap();
+    let mut conn = mutex_map.get_mut(&db_path).ok_or(Error::NotConnected(db_path))?;
+    match sqlite_batch(&mut conn, queries) {
+        Ok(result) => Ok(result),
+        Err(e) => Err(Error::Rusqlite(e))
     }
 }
 
 /// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
   Builder::new("taurusqlite")
-    .invoke_handler(tauri::generate_handler![open])
+    .invoke_handler(tauri::generate_handler![open, select, execute, set_pragma, batch, load])
     .setup(|app| {
         app.manage(DbInstances::default());
         Ok(())

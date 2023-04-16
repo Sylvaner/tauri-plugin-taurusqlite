@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^1.0.0",
+    "sqlite-tablegenerator": "https://github.com/Sylvaner/SQLite-TableGenerator",
     "tslib": "^2.1.0"
   }
 }
